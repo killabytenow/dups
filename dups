@@ -1,0 +1,781 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Cwd qw(realpath);
+use Data::Dumper;
+use Digest;
+use DB_File;
+use File::Basename;
+use File::Spec;
+use IO::Pipe;
+use Storable qw(freeze thaw);
+use Getopt::Long;
+use Carp;
+use JSON;
+use POSIX;
+
+my $TMP = "/tmp/repsearch";
+my $quiet = 0;
+my $debug = 0;
+my (%actions, %cfg, $cfg_file, %files);
+
+sub __msg
+{
+	my $nl = shift;
+	my $t = shift;
+	my $m = "";
+
+	$t = $t ? "$t: " : "";
+
+	if(scalar(@_) < 1) {
+		$m .= "<< VOID MSG >>";
+	} elsif(scalar(@_) > 1) {
+		my $f = shift;
+		$m .= sprintf($f, @_);
+	} else {
+		$m .= shift;
+	}
+
+	print STDERR $t . join("\n$t", split(/\n/, $m)) . ($nl ? "\n" : "");
+
+	return $m;
+}
+
+sub raw { __msg(0, undef, @_) if(!$quiet); }
+sub dbg { __msg(1, "debug",   @_) if($debug); }
+sub msg { __msg(1, undef,     @_) if(!$quiet); }
+sub wrn { __msg(1, "warning", @_); }
+sub err { __msg(1, "error",   @_); }
+sub fat { __msg(1, "fatal",   @_); die "Fatal"; }
+
+sub new_config
+{
+	my ($cfg) = @_;
+
+	%{$cfg} = (
+		basedir       => File::Spec->curdir(),
+		"master"      => [],
+		slave         => [],
+		files_db      => undef,
+		hashes_db     => undef,
+		files         => {},
+		hashes        => {},
+		shell         => "/bin/bash",
+		zcat          => "/bin/zcat",
+		xzcat         => "/usr/bin/xzcat",
+		json          => 1,
+		gz            => 1,
+		xz            => 1,
+		"action_m:m"  => [],
+		"action_m:s"  => [],
+		"action_s:s"  => [],
+		"action_m"    => [],
+		"action_s"    => [],
+		bytes_deleted => 0,
+		dups_deleted  => 0,
+	);
+}
+
+sub read_config
+{
+	my ($f, $fh, $cfg) = @_;
+	my ($section, $key, $op, $val);
+
+	while(my $l = <$fh>) {
+		# clean lines and ignore comments
+		chomp $l;
+		next if($l =~ /^\s*(?:#.*)?$/);
+
+		if($l =~ /^\s*\[([a-zA-Z0-9_-]+)\]\s*$/) {
+			$section = $1;
+			if($section ne "config"
+			&& !exists($cfg->{scripts}->{$section})) {
+				$cfg->{scripts}->{$section} = "";
+			}
+		} elsif($l =~ /^\s*
+				include \s+
+					(?: (?<f> [^\s"'][^\s]+)
+					|   (?: " (?<f> (?:[^"]|\\")+ ) " )
+					|   (?: ' (?<f> (?:[^']|\\')+ ) ' )
+					) \s*$/ix) {
+			if(open(my $sfh, "<", $+{f})) {
+				read_config($+{f}, $sfh, $cfg);
+			} else {
+				fat("%s: cannot include config: %s", $+{f}, $!);
+			}
+		} elsif($section eq "config") {
+			$l =~ s/(^\s*|\s*$)//g;
+			if($l !~ /^
+					(?<key> [^=\+\s]+)
+					\s* (?<op>\+?=) \s*
+					(?:
+						(?<val>[^"'\s].*)
+					|	"(?<val>(?:[^"]|\\")+)"
+					|	'(?<val>(?:[^']|\\')+)'
+					)$/x) {
+				fat("%s: %d: bad config syntax.", $f, $fh->input_line_number);
+			}
+			$key = lc($+{key});
+			$op  = $+{op};
+			$val = $+{val};
+
+			fat("%s: %d: Op += cannot be used with key %s",
+					$f, $fh->input_line_number, $key)
+				if($op eq "+=" && $key !~ /^(master|slave|action_(m:[ms]|s:s))$/);
+			if($key eq "hashes") {
+				$cfg->{hashes_db} = $val;
+			} elsif($key eq "files") {
+				$cfg->{files_db} = $val;
+			} elsif($key eq "slave") {
+				push(@{$cfg->{slave}}, $val);
+			} elsif($key eq "master") {
+				push(@{$cfg->{master}}, $val);
+			} elsif($key =~ /^action_(m(:[ms])?|s(:s)?)$/) {
+				if($op eq "+=") {
+					push(@{$cfg->{$key}}, $val);
+				} else {
+					@{$cfg->{$key}} = ( $val );
+				}
+			} elsif($key =~ /^(shell|[gx]z)$/) {
+				$cfg->{$key} = $val;
+			} else {
+				fat("%s: %d: bad config entry '%s'", $f, $fh->input_line_number, $key);
+			}
+		} else {
+			$cfg->{scripts}->{$section} .= "$l\n";
+		}
+	}
+}
+
+sub open_config
+{
+	my ($f, $cfg) = @_;
+	my ($section, $key, $op, $val);
+
+	msg("Loading config '%s'...", $f);
+	$cfg->{basedir} = File::Basename::dirname(realpath($f));
+
+	if(open(my $fh, "<", $f)) {
+		read_config($f, $fh, $cfg);
+	}
+
+	msg("  - basedir '%s'.", $cfg->{basedir});
+	msg("  - TIE to '%s'.", $cfg->{files_db});
+	$cfg->{files_db} = tie %{$cfg->{files}}, 'DB_File', $cfg->{files_db}, O_RDWR|O_CREAT, 0640, $DB_HASH
+		or fat("%s: Cannot open files DB: %s", $cfg->{files_db}, $!);
+	if($cfg->{hashes_db}) {
+		msg("  - TIE to '%s'.", $cfg->{hashes_db});
+		$cfg->{hashes_db} = tie %{$cfg->{hashes}}, 'DB_File', $cfg->{hashes_db}, O_RDWR|O_CREAT, 0640, $DB_HASH
+			or fat("%s: Cannot open hashes DB: %s", $cfg->{hashes_db}, $!);
+	} else {
+		msg("  - calculating hashes relationships");
+		foreach my $f (map { db_file_get($cfg, $_) } keys %{$cfg->{files}}) {
+			msg("      %s", $f->{path}) if(!$f->{hash});
+			my $h = db_hash_exists($cfg, $f->{hash})
+				? db_hash_get($cfg, $f->{hash})
+				: db_hash_set($cfg, {
+					create => 1,
+					hash   => $f->{hash},
+				});
+			db_hash_add_file($cfg, $h, $f->{path});
+		}
+	}
+	msg("  - config loaded");
+#fat("%s: %d: bad action '%s'.", $f, $fh->input_line_number, $val);
+#	#$hash{'key'} = 'value';
+#
+#	#tie(%hash2, 'Tie::DB_Lock', $filename); # Default is read-only
+#	#print("Value is $hash2{'key'}\n");
+#	#untie %hash;
+}
+
+sub close_config
+{
+	my ($cfg) = @_;
+
+	untie %{$cfg->{hashes}};
+	untie %{$cfg->{files}};
+}
+
+sub hash_reduced
+{
+	my $hash = shift;
+	$hash =~ s/^(.{7}).*(.{7})/$1..$2/;
+	return $hash;
+}
+
+sub hash_file
+{
+	my ($cfg, $f) = @_;
+	my $digest = Digest->new("SHA-256");
+	my $fh;
+
+	if($cfg->{xz} && $f =~ /\.xz$/) {
+		open($fh, "-|", $cfg->{xzcat}, $f)
+		or fat("%s: Cannot decompress using xzcat: %s", $f, $!);
+		dbg("Decompressing '%s' using %s", $f, $cfg->{xzcat});
+	}
+	if($cfg->{gz} && $f =~ /\.gz$/) {
+		open($fh, "-|", $cfg->{zcat}, $f)
+		or fat("%s: Cannot decompress using zcat: %s", $f, $!);
+		dbg("Decompressing '%s' using %s", $f, $cfg->{zcat});
+	}
+	if(!$fh) {
+		open($fh, "<", $f)
+		or fat("%s: Cannot read: %s", $f, $!);
+	}
+	$digest->addfile($fh);
+	close($fh);
+
+	return $digest->hexdigest;
+}
+
+sub __db_reg_set
+{
+	my ($cfg, $db, $pk, $fields, $reg) = @_;
+	my ($index);
+
+	# get primary key
+	$index = $reg->{$pk};
+	fat("__db_reg_set: %s{%s/undef} undefined index.\nreg = %s", $db, $pk, Dumper($reg))
+		if(!defined($index));
+
+	# if creation is asked, check that reg does not exist yet. Otherwise check that it exists.
+	if(!$reg->{create}) {
+		fat("__db_reg_set: %s{%s/%s} does not exists.\nreg = %s", $db, $pk, $index, Dumper($reg))
+			if(!exists($cfg->{$db}->{$index}));
+	} else {
+		fat("__db_reg_set: %s{%s/%s} already exists.\nreg = %s", $db, $pk, $index, Dumper($reg))
+			if(exists($cfg->{$db}->{$index}));
+		delete $reg->{create};
+	}
+
+	# check that all mandatory fields are in $reg
+	foreach my $field (grep { $fields->{$_}->[0] } keys %{$fields}) {
+		fat("__db_reg_set: field %s{%s} not defined.\nreg = %s", $db, $field, Dumper($reg))
+			if(!exists($reg->{$field}));
+	}
+	# check that all fields in %reg are declared in %fields
+	foreach my $field (keys %{$reg}) {
+		fat("__db_reg_set: field %s{%s} not exists in definition.\nreg = %s", $db, $field, Dumper($reg))
+			if(!exists($fields->{$field}));
+	}
+	# if a field does not exist, add in reg (using default value)
+	foreach my $field (grep { ! $fields->{$_}->[0] } keys %{$fields}) {
+		$reg->{$field} = $fields->{$field}->[1]
+			if(!exists($reg->{$field}));
+	}
+
+	#dbg("__db_reg_set: freeze(%s{%s)}:\nreg = %s", $db, $index, Dumper($reg)) if($db eq "files");
+	if($cfg->{"${db}_db"}) {
+		delete $reg->{$pk};
+		$cfg->{$db}->{$index} =
+			$cfg->{json}
+				? encode_json($reg)
+				: freeze($reg);
+		$reg->{$pk} = $index;
+		$cfg->{"${db}_db"}->sync;
+	} else {
+		$cfg->{$db}->{$index} = $reg;
+	}
+
+	return $reg;
+}
+
+sub __db_reg_get
+{
+	my ($cfg, $db, $pk, $index) = @_;
+	my ($reg);
+
+	fat("__db_reg_get: register %s{%s} == %s does not exist.", $db, $pk, $index)
+		if(!exists($cfg->{$db}->{$index}));
+
+	$reg = !$cfg->{"${db}_db"}
+			? $cfg->{$db}->{$index}
+			: $cfg->{json}
+				? decode_json($cfg->{$db}->{$index})
+				: thaw($cfg->{$db}->{$index});
+	$reg->{$pk} = $index;
+	#dbg("__db_reg_get: thaw(%s{%s}):\nreg = %s", $db, $index, Dumper($reg));
+
+	return $reg;
+}
+
+sub __db_reg_exists
+{
+	my ($cfg, $db, $pk, $index) = @_;
+
+	return exists($cfg->{$db}->{$index});
+}
+
+sub __db_reg_del
+{
+	my ($cfg, $db, $pk, $index) = @_;
+	my ($reg);
+
+	fat("__db_reg_get: register %s{%s/%s} does not exist.", $db, $pk, $index)
+		if(!exists($cfg->{$db}->{$index}));
+
+	delete $cfg->{$db}->{$index};
+}
+
+sub db_file_set
+{
+	my ($cfg, $fi) = @_;
+	__db_reg_set(
+		$cfg,
+		"files", "path",
+		{
+			path    => [ 1 ],
+			master  => [ 1 ],
+			mtime   => [ 1 ],
+			size    => [ 1 ],
+			hash    => [ 0, undef ],
+			deleted => [ 0, 0 ],
+		},
+		$fi);
+	return $fi;
+}
+
+sub db_file_get    { my ($cfg, $path) = @_; return __db_reg_get($cfg, "files", "path", $path); }
+sub db_file_exists { my ($cfg, $path) = @_; return __db_reg_exists($cfg, "files", "path", $path); }
+sub db_file_del    { my ($cfg, $path) = @_; return __db_reg_del($cfg, "files", "path", $path); }
+
+sub db_hash_set
+{
+	my ($cfg, $hi) = @_;
+	__db_reg_set(
+		$cfg,
+		"hashes", "hash",
+		{
+			hash  => [ 1 ],
+			files => [ 0, [] ],
+		},
+		$hi);
+	return $hi;
+}
+sub db_hash_get    { my ($cfg, $hash) = @_; return __db_reg_get($cfg, "hashes", "hash", $hash); }
+sub db_hash_exists { my ($cfg, $hash) = @_; return __db_reg_exists($cfg, "hashes", "hash", $hash); }
+sub db_hash_add_file
+{
+	my ($cfg, $hash, @files) = @_;
+
+	foreach my $file (@files) {
+		push(@{$hash->{files}}, $file)
+			if(! grep { $file eq $_ } @{$hash->{files}});
+	}
+
+	db_hash_set($cfg, $hash);
+}
+sub db_hash_del_file
+{
+	my ($cfg, $hash, @files) = @_;
+
+	foreach my $file (@files) {
+		for(my $i = 0; $i < scalar(@{$hash->{files}}); $i++) {
+			if($hash->{files}->[$i] eq $file) {
+				splice @{$hash->{files}}, $i, 1;
+				last;
+			}
+		}
+	}
+
+	db_hash_set($cfg, $hash);
+}
+
+sub hash_files_status
+{
+	my ($s, $i, $l) = @_;
+	raw("[%s] [%s%s] %3.2f%% (%d files processed)  \r",
+		$s,
+		"#" x (($i * 20) / $l),
+		"·" x (20 - (($i * 20) / $l)),
+		$i * 100.0 / $l,
+		$i);
+}
+
+sub clean_files
+{
+	my ($cfg, $mark, $files) = @_;
+
+	foreach my $f (map { db_file_get($cfg, $_) }
+			grep { ! -e $_ }
+				($files ? @{$files} : keys %{$cfg->{files}})) {
+		if($mark) {
+			if(!$f->{deleted}) {
+				msg("%s: Entry marked as deleted (it does not exists)", $f->{path});
+				$f->{deleted} = 1;
+				db_file_set($cfg, $f);
+				$cfg->{bytes_deleted} += $f->{size};
+				$cfg->{dups_deleted}++;
+			}
+		} else {
+			msg("%s: Deleting entry (it does not exists)", $f->{path});
+			db_hash_del_file($cfg, db_hash_get($cfg, $f->{hash}), $f->{path});
+			db_file_del($cfg, $f->{path});
+			$cfg->{bytes_deleted} += $f->{size};
+			$cfg->{dups_deleted}++;
+		}
+	}
+}
+
+sub hash_files
+{
+	my ($fl, $cfg) = @_;
+	my (@fla, $f, $hi, $fi, $master, $mtime, $size);
+
+	@fla = sort keys %{$fl};
+
+	for(my $i = 0; $i < scalar(@fla); $i++) {
+		$f = $fla[$i];
+		$master = $fl->{$f};
+#msg($f);
+		hash_files_status("FF", $i, scalar(@fla));
+
+		# get basic file properties
+		$mtime = (stat($f))[9];
+		$size  = -s $f;
+
+		# fetch/create file info structure
+		if(db_file_exists($cfg, $f)) {
+			$fi = db_file_get($cfg, $f);
+			if($fi->{mtime} != $mtime || $fi->{size} != $size) {
+				hash_files_status(
+					$fi->{mtime} != $mtime ? "Hm" : "Hs",
+					$i, scalar(@fla));
+				$fi->{hash}  = hash_file($cfg, $f);
+				$fi->{mtime} = $mtime;
+				$fi->{size}  = $size;
+				db_file_set($cfg, $fi);
+			}
+		} else {
+			hash_files_status("Hh", $i, scalar(@fla));
+			$fi = db_file_set($cfg, {
+					create => 1,
+					path   => $f,
+					hash   => hash_file($cfg, $f),
+					mtime  => $mtime,
+					size   => $size,
+					"master" => $master,
+			});
+		}
+
+		# fetch hash info
+		if(db_hash_exists($cfg, $fi->{hash})) {
+			$hi = db_hash_get($cfg, $fi->{hash});
+			#dbg("%s: is dup of (%s).", $f, join(", ", @{$hi->{files}}));
+		} else {
+			$hi = db_hash_set($cfg, {
+				create => 1,
+				hash   => $fi->{hash},
+			});
+		}
+
+		# link hi to fi
+		db_hash_add_file($cfg, $hi, $f);
+
+		#printf "fi: %s\nhi: %s\n", Dumper($fi), Dumper($hi);
+	}
+}
+
+sub get_files
+{
+	my ($cfg, $master, $fl, $d) = @_;
+	my @r;
+
+	if(!-d $d) {
+		err("%s: is not a directory", $d);
+		return;
+	}
+
+	foreach my $f (map { realpath($_); } <"$d/*">) {
+		if($f !~ /^\Q$cfg->{basedir}\E\//) {
+			wrn("%s: outside of base directory.", $f);
+		} elsif(-d $f) {
+			get_files($cfg, $master, $fl, $f);
+		} elsif(-l $f) {
+			wrn("%s: ignored soft link", $f);
+		} elsif(-f $f) {
+			$fl->{File::Spec->abs2rel($f, $cfg->{basedir})} ||= $master;
+		} else {
+			err("%s: unknown file type", $f);
+		}
+	}
+
+	return @r;
+}
+
+sub __launch_script
+{
+	my ($cfg, $type, $script, $rfile, $flist) = @_;
+
+	my ($r, $w) = POSIX::pipe();
+	fat("read fd is not 3! (r=%d, w=%d)\n", $r, $w)
+		if($r != 3);
+
+	$ENV{DUPS_PID} = $$;
+	$ENV{SPACE_DELETED} = $cfg->{bytes_deleted} < 1024
+				? sprintf("%d bytes", $cfg->{bytes_deleted})
+				: $cfg->{bytes_deleted} < 1024*1024
+					? sprintf("%.2f Kb", $cfg->{bytes_deleted} / 1024.0)
+					: $cfg->{bytes_deleted} < 1024*1024*1024
+						? sprintf("%.2f Mb", $cfg->{bytes_deleted} / (1024.0*1024.0))
+						: sprintf("%.2f Gb", $cfg->{bytes_deleted} / (1024.0*1024.0*1024.0));
+	$ENV{BYTES_DELETED} = $cfg->{bytes_deleted};
+	$ENV{DUPS_DELETED} = $cfg->{dups_deleted};
+	$ENV{MASTER_FOLDERS} = join(":", @{$cfg->{master}});
+	$ENV{SLAVE_FOLDERS} = join(":", @{$cfg->{slave}});
+
+	my $pid = fork();
+	fat("Cannot fork.")
+		if($pid < 0);
+	if(!$pid) {
+		# child
+		POSIX::close($w);
+		$ENV{FILE} = $rfile;
+		$ENV{DUPS_TYPE} = $type;
+
+		exec($cfg->{shell}, "-c", $script)
+			or fat("Exec failed: %s", $!);
+        } else {
+		# parent
+		POSIX::close($r);
+		my $w_io = IO::Handle->new();
+		fat("Cannot open FD %d", $w)
+			if(!$w_io->fdopen($w, "w"));
+
+		foreach my $f (@{$flist}) {
+			print $w_io "$f\n";
+		}
+		$w_io->close;
+
+		if(waitpid($pid, 0) < 0) {
+			fat("waitpid: $!");
+		}
+	}
+}
+
+my %script_cache;
+sub compose_script
+{
+	my ($cfg, $action_name) = @_;
+	my ($script, $__action_name);
+
+	return $script_cache{$action_name}
+		if(exists($script_cache{$action_name}));
+
+	$script = "\@include[$action_name]\n";
+	while(1) {
+		last if($script !~
+			/^
+				\s*
+				\@ \s* include \s*
+					\[ (?<action_name>[a-zA-Z0-9_]+) \]
+				\s*
+			$/mx);
+		$__action_name = $+{action_name};
+		fat("Action '%s' not defined.", $__action_name)
+			if(!exists($cfg->{scripts}->{$__action_name}));
+		$script =~ s{^\s* \@ \s* include \s* \[ \Q$__action_name\E \] \s*$}
+				{$cfg->{scripts}->{$__action_name}\n}mx;
+	}
+	#msg("final script:\n%s", $script);
+	$script_cache{$action_name} = $script;
+	return $script;
+}
+
+sub launch_scripts
+{
+	my ($cfg, $type, $rfile, $flist) = @_;
+
+	#msg("%s: %s\n\t(%s)",
+	#	$type,
+	#	$rfile,
+	#	join(", ", @{$flist}));
+	foreach my $action_name (@{$cfg->{"action_$type"}}) {
+		__launch_script(
+			$cfg,
+			$type,
+			compose_script($cfg, $action_name),
+			$rfile,
+			$flist);
+	}
+	clean_files(\%cfg, 1, [$rfile, @{$flist}]);
+}
+
+%actions = (
+	reset => [
+		"Reset database.",
+		sub {
+			%{$cfg{hashes}} = ();
+			%{$cfg{files}} = ();
+		}
+	],
+	rdup => [
+		"Print a report of dups.",
+		sub {
+			foreach my $f (map { db_file_get(\%cfg, $_) } sort keys %{$cfg{files}}) {
+				my $h = db_hash_get(\%cfg, $f->{hash});
+				fat("UGLY")
+					if(scalar(@{$h->{files}}) == 0);
+				foreach my $d (map { db_file_get(\%cfg, $_) }
+						grep { $_ ne $f->{path} }
+							sort @{$h->{files}}) {
+					printf "%sD %s %s %s %d\n",
+						$d->{master} ? "M" : "S",
+						POSIX::strftime("%Y/%m/%d %H:%M:%S", localtime($d->{mtime})),
+						hash_reduced($d->{hash}),
+						$d->{path}, $d->{size};
+				}
+			}
+		},
+	],
+	report => [
+		"Print a report of the current status and needed actions.",
+		sub {
+			foreach my $f (map { db_file_get(\%cfg, $_) } sort keys %{$cfg{files}}) {
+				my $h = db_hash_get(\%cfg, $f->{hash});
+				fat("UGLY")
+					if(scalar(@{$h->{files}}) == 0);
+				if($f->{master}) {
+					printf "MU %s %s %d (%s)\n",
+						POSIX::strftime("%Y/%m/d %H:%M:%S", localtime($f->{mtime})),
+						$f->{path}, $f->{size},
+						$f->{hash};
+					foreach my $d (map { db_file_get(\%cfg, $_) }
+							grep { $_ ne $f->{path} }
+								sort @{$h->{files}}) {
+						printf "%sD %s %s %d (%s)\n",
+							$d->{master} ? "M" : "S",
+							POSIX::strftime("%Y/%m/%d %H:%M:%S", localtime($d->{mtime})),
+							$d->{path}, $d->{size},
+							$d->{hash};
+					}
+				} else {
+					printf "SU %s %s %d (%s)\n",
+							POSIX::strftime("%Y/%m/d %H:%M:%S", localtime($f->{mtime})),
+							$f->{path}, $f->{size},
+							$f->{hash}
+						if(scalar(@{$h->{files}}) == 1);
+				}
+			}
+		},
+	],
+	hash => [
+		"Hash files and directories.",
+		sub {
+			msg("Traversing directories...");
+			get_files(\%cfg, 1, \%files, $_) foreach (@{$cfg{master}});
+			get_files(\%cfg, 0, \%files, $_) foreach (@{$cfg{slave}});
+
+			msg("Found %d files.", scalar(keys %files));
+
+			msg("Cleaning deleted files...");
+			clean_files(\%cfg, 0);
+
+			msg("Hashing files...");
+			hash_files(\%files, \%cfg);
+		},
+	],
+	hashes => [
+		"Dump hashes.",
+		sub {
+			msg(Dumper($cfg{hashes}));
+		},
+	],
+	files => [
+		"Dump files.",
+		sub {
+			msg(Dumper($cfg{files}));
+		},
+	],
+	run => [
+		"Run scripts.",
+		sub {
+			my ($mlist, $slist, $rfile);
+
+			msg("Marking deleted files...");
+			get_files(\%cfg, 1, \%files, $_) foreach (@{$cfg{master}});
+			get_files(\%cfg, 0, \%files, $_) foreach (@{$cfg{slave}});
+			clean_files(\%cfg, 1);
+
+			msg("Running scripts...");
+			foreach my $h (map { db_hash_get(\%cfg, $_) } sort keys %{$cfg{hashes}}) {
+				# uild list and fetch master file
+				$mlist = [];
+				$slist = [];
+				foreach my $f (grep { !$_->{deleted} } map { db_file_get(\%cfg, $_) } @{$h->{files}}) {
+					push(@{$f->{master} ? $mlist : $slist}, $f->{path});
+				}
+				#msg("%s: %d/%d", $h->{hash}, scalar(@{$mlist}), scalar(@{$slist}))
+				#	if(scalar(@{$mlist}) + scalar(@{$slist}) > 1);
+				$rfile = shift @{$mlist};
+				if(defined($rfile)) {
+					launch_scripts(\%cfg, "m:m", $rfile, $mlist)
+						if(scalar(@{$mlist}));
+					launch_scripts(\%cfg, "m:s", $rfile, $slist)
+						if(scalar(@{$slist}));
+					launch_scripts(\%cfg, "m", $rfile, [])
+						if(!scalar(@{$mlist}) && !scalar(@{$slist}));
+						
+				} else {
+					$rfile = shift @{$slist};
+					if(scalar(@{$slist})) {
+						launch_scripts(\%cfg, "s:s", $rfile, $slist);
+					} else {
+						launch_scripts(\%cfg, "s", $rfile, []);
+					}
+				}
+			}
+		},
+	],
+	help => [
+		"This help.",
+		sub {
+			msg("Syntax:");
+			msg("	%s [...options...] {action}", $0);
+			msg("Actions:");
+			foreach my $a (keys %actions) {
+				msg("\t%s\t%s", $a, $actions{$a}->[0]);
+			}
+		},
+	],
+);
+
+
+new_config \%cfg;
+
+Getopt::Long::Configure("auto_help");
+Getopt::Long::Configure("bundling");
+GetOptions(
+	"config|c=s" => \$cfg_file,
+	"debug|D"    => \$debug,
+	"quiet|q"    => \$quiet,
+) or die("Error in command line arguments\n");
+
+fat("Need an action!")
+	if(scalar(@ARGV) != 1);
+my $action = shift @ARGV;
+if(!defined($cfg_file)) {
+	$cfg_file = "dups.cfg"
+		if(-e "dups.cfg");
+} else {
+	$cfg_file = "$cfg_file/dups.cfg"
+		if(-d $cfg_file);
+}
+fat("Configuration file not found.")
+	if(!defined($cfg_file));
+fat("%s: Configuration file not found.", $cfg_file)
+	if(! -e $cfg_file);
+
+open_config($cfg_file, \%cfg);
+
+$action = lc($action);
+fat("Unknown action '%s'.", $action)
+	if(!$actions{$action});
+$actions{$action}->[1]->();
+
+close_config(\%cfg);
+
