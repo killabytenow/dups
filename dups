@@ -324,6 +324,9 @@ sub __db_reg_del
 sub db_file_set
 {
 	my ($cfg, $fi) = @_;
+	if(exists($fi->{master})) {
+		$fi->{master} = $fi->{master} ? 1 : 0;
+	}
 	__db_reg_set(
 		$cfg,
 		"files", "path",
@@ -385,34 +388,63 @@ sub db_hash_del_file
 	db_hash_set($cfg, $hash);
 }
 
+my $_hash_files_status_last_percent = "";
 sub hash_files_status
 {
 	my ($s, $i, $l) = @_;
-	raw("[%s] [%s%s] %3.2f%% (%d files processed)  \r",
+	my $percent = sprintf("%3.2f%%", $i * 100.0 / $l);
+	return if($percent eq $_hash_files_status_last_percent);
+	$_hash_files_status_last_percent = $percent;
+	raw("[%s] [%s%s] %s (%d files processed)  \r",
 		$s,
 		"#" x (($i * 20) / $l),
 		"·" x (20 - (($i * 20) / $l)),
-		$i * 100.0 / $l,
+		$percent,
 		$i);
+}
+
+sub file_inside_folder_list
+{
+	my ($cfg, $file, $flist) = @_;
+
+#msg("[%s]", join(",", @{$flist}));
+	foreach my $folder (@{$flist}) {
+		$folder = File::Spec->abs2rel($folder, $cfg->{basedir});
+		$folder =~ s/^\.\///g;
+#msg($folder);
+		return 1
+			if($folder eq ""
+				? $file =~ /^\Q$folder\E\//
+				: $file =~ /^[^\/]/);
+	}
+	return 0;
 }
 
 sub clean_files
 {
 	my ($cfg, $mark, $files) = @_;
+	my ($exist);
 
 	foreach my $f (map { db_file_get($cfg, $_) }
-			grep { ! -e $_ }
+			grep { ! -e $_ ||
+				!(file_inside_folder_list($cfg, $_, $cfg->{master})
+				|| file_inside_folder_list($cfg, $_, $cfg->{slave})) }
 				($files ? @{$files} : keys %{$cfg->{files}})) {
+		$exist = -e $f->{path};
 		if($mark) {
 			if(!$f->{deleted}) {
-				msg("%s: Entry marked as deleted (it does not exists)", $f->{path});
+				msg("%s: Entry marked as deleted (%s)",
+					$f->{path},
+					$exist ? "outside folders" : "it does not exists");
 				$f->{deleted} = 1;
 				db_file_set($cfg, $f);
 				$cfg->{bytes_deleted} += $f->{size};
 				$cfg->{dups_deleted}++;
 			}
 		} else {
-			msg("%s: Deleting entry (it does not exists)", $f->{path});
+			msg("%s: Deleting entry (%s)",
+				$f->{path},
+				$exist ? "outside folders" : "it does not exists");
 			db_hash_del_file($cfg, db_hash_get($cfg, $f->{hash}), $f->{path});
 			db_file_del($cfg, $f->{path});
 			$cfg->{bytes_deleted} += $f->{size};
@@ -430,7 +462,7 @@ sub hash_files
 
 	for(my $i = 0; $i < scalar(@fla); $i++) {
 		$f = $fla[$i];
-		$master = $fl->{$f};
+		$master = $fl->{$f} ? 1 : 0;
 #msg($f);
 		hash_files_status("FF", $i, scalar(@fla));
 
@@ -440,26 +472,47 @@ sub hash_files
 
 		# fetch/create file info structure
 		if(db_file_exists($cfg, $f)) {
+			my $touch = 0;
 			$fi = db_file_get($cfg, $f);
 			if($fi->{mtime} != $mtime || $fi->{size} != $size) {
 				hash_files_status(
 					$fi->{mtime} != $mtime ? "Hm" : "Hs",
 					$i, scalar(@fla));
-				$fi->{hash}  = hash_file($cfg, $f);
+				$touch = -1
+					if(!($fi->{hash}  = hash_file($cfg, $f)));
 				$fi->{mtime} = $mtime;
 				$fi->{size}  = $size;
+				$touch = 1 if(!$touch);
+			}
+			if($fi->{master} != $master) {
+				$fi->{master} = $master;
+				$touch = 1 if(!$touch);
+			}
+			if($touch > 0) {
 				db_file_set($cfg, $fi);
+			} elsif($touch < 0) {
+				db_file_del($cfg, $fi->{path}) if($touch < 0);
+				undef $fi;
 			}
 		} else {
 			hash_files_status("Hh", $i, scalar(@fla));
-			$fi = db_file_set($cfg, {
-					create => 1,
-					path   => $f,
-					hash   => hash_file($cfg, $f),
-					mtime  => $mtime,
-					size   => $size,
-					"master" => $master,
-			});
+			my $h = hash_file($cfg, $f);
+			if($h) {
+				$fi = db_file_set($cfg, {
+						create => 1,
+						path   => $f,
+						hash   => $h,
+						mtime  => $mtime,
+						size   => $size,
+						"master" => $master,
+				});
+			} else {
+				undef $fi;
+			}
+		}
+		if(!$fi) {
+			wrn("%s: cannot hash. File vanished?", $f);
+			next;
 		}
 
 		# fetch hash info
@@ -490,13 +543,13 @@ sub get_files
 		return;
 	}
 
-	foreach my $f (map { realpath($_); } <"$d/*">) {
+	foreach my $f (map { realpath($_) || $_; } <"$d/*">) {
 		if($f !~ /^\Q$cfg->{basedir}\E\//) {
 			wrn("%s: outside of base directory.", $f);
 		} elsif(-d $f) {
 			get_files($cfg, $master, $fl, $f);
 		} elsif(-l $f) {
-			wrn("%s: ignored soft link", $f);
+			dbg("%s: ignored soft link", $f);
 		} elsif(-f $f) {
 			$fl->{File::Spec->abs2rel($f, $cfg->{basedir})} ||= $master;
 		} else {
@@ -590,10 +643,10 @@ sub launch_scripts
 {
 	my ($cfg, $type, $rfile, $flist) = @_;
 
-	#msg("%s: %s\n\t(%s)",
-	#	$type,
-	#	$rfile,
-	#	join(", ", @{$flist}));
+#	msg("%s: %s\n\t(%s)",
+#		$type,
+#		$rfile,
+#		join(", ", @{$flist}));
 	foreach my $action_name (@{$cfg->{"action_$type"}}) {
 		__launch_script(
 			$cfg,
@@ -667,8 +720,14 @@ sub launch_scripts
 		"Hash files and directories.",
 		sub {
 			msg("Traversing directories...");
-			get_files(\%cfg, 1, \%files, $_) foreach (@{$cfg{master}});
-			get_files(\%cfg, 0, \%files, $_) foreach (@{$cfg{slave}});
+			foreach my $d (@{$cfg{master}}) {
+				dbg(" (master) %s", $d);
+				get_files(\%cfg, 1, \%files, $d);
+			}
+			foreach my $d (@{$cfg{slave}}) {
+				dbg(" (slave) %s", $d);
+				get_files(\%cfg, 0, \%files, $d);
+			}
 
 			msg("Found %d files.", scalar(keys %files));
 
@@ -720,13 +779,15 @@ sub launch_scripts
 					launch_scripts(\%cfg, "m", $rfile, [])
 						if(!scalar(@{$mlist}) && !scalar(@{$slist}));
 						
-				} else {
+				} elsif(scalar(@{$slist}) > 0) {
 					$rfile = shift @{$slist};
 					if(scalar(@{$slist})) {
 						launch_scripts(\%cfg, "s:s", $rfile, $slist);
 					} else {
 						launch_scripts(\%cfg, "s", $rfile, []);
 					}
+				} else {
+					wrn("No files for hash %s", $h->{hash});
 				}
 			}
 		},
