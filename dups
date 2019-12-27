@@ -545,8 +545,9 @@ sub get_files
 
 	foreach my $f (map { realpath($_) || $_; } <"$d/*">) {
 		if($f !~ /^\Q$cfg->{basedir}\E\//) {
-			wrn("%s: outside of base directory.", $f);
-		} elsif(-d $f) {
+			wrn("%s: outside of base directory %s.", $f, $cfg->{basedir});
+		}
+		if(-d $f) {
 			get_files($cfg, $master, $fl, $f);
 		} elsif(-l $f) {
 			dbg("%s: ignored soft link", $f);
@@ -580,6 +581,7 @@ sub __launch_script
 	$ENV{DUPS_DELETED} = $cfg->{dups_deleted};
 	$ENV{MASTER_FOLDERS} = join(":", @{$cfg->{master}});
 	$ENV{SLAVE_FOLDERS} = join(":", @{$cfg->{slave}});
+	$ENV{DEBUG} = $debug || "";
 
 	my $pid = fork();
 	fat("Cannot fork.")
@@ -719,11 +721,12 @@ sub launch_scripts
 	hash => [
 		"Hash files and directories.",
 		sub {
-			msg("Traversing directories...");
+			msg("Traversing directories (master)...");
 			foreach my $d (@{$cfg{master}}) {
 				dbg(" (master) %s", $d);
 				get_files(\%cfg, 1, \%files, $d);
 			}
+			msg("Traversing directories (slave)...");
 			foreach my $d (@{$cfg{slave}}) {
 				dbg(" (slave) %s", $d);
 				get_files(\%cfg, 0, \%files, $d);
@@ -741,7 +744,8 @@ sub launch_scripts
 	hashes => [
 		"Dump hashes.",
 		sub {
-			msg(Dumper($cfg{hashes}));
+			print Dumper($cfg{hashes});
+			print "\n";
 		},
 	],
 	files => [
